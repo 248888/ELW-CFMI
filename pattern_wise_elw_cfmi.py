@@ -4,7 +4,7 @@ The implementation follows the pseudo-code in
 ``pattern_wise_elw_cfmi_reformatted.pdf``:
 
 1. Split samples by observed-missing pattern.
-2. Estimate sample-level empirical likelihood weights inside each pattern.
+2. Use ``pattern_wise_elw.py`` to compute sample-level ELW weights.
 3. Train one shared conditional flow-matching velocity field.
 4. Impute missing values by Euler integration from Gaussian noise.
 
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 from typing import Literal
 from typing import Mapping
 from typing import Sequence
@@ -33,35 +32,10 @@ import numpy as np
 import torch
 from torch import nn
 
-
-PatternKey = tuple[int, ...]
-TargetMoments = np.ndarray | Mapping[PatternKey, np.ndarray]
-BalanceFn = Callable[
-    [np.ndarray, np.ndarray, np.ndarray, PatternKey],
-    tuple[np.ndarray, np.ndarray],
-]
-
-
-@dataclass
-class PatternWeightResult:
-    """Container for pattern-wise sample weights.
-
-    Attributes
-    ----------
-    sample_weights:
-        Global training weights ``a_i = rho_m * omega_i^(m)``. They sum to 1.
-    within_pattern_weights:
-        Pattern-local ELW weights. Each vector sums to 1.
-    pattern_weights:
-        Pattern weights ``rho_m``.
-    pattern_indices:
-        Row indices belonging to each pattern.
-    """
-
-    sample_weights: np.ndarray
-    within_pattern_weights: dict[PatternKey, np.ndarray]
-    pattern_weights: dict[PatternKey, float]
-    pattern_indices: dict[PatternKey, np.ndarray]
+from pattern_wise_elw import Pattern
+from pattern_wise_elw import PatternWiseELWResult
+from pattern_wise_elw import estimate_propensity_by_pattern
+from pattern_wise_elw import pattern_wise_elw_weights
 
 
 @dataclass
@@ -141,239 +115,6 @@ class SimpleMLPVelocity(nn.Module):
             dim=-1,
         )
         return self.net(features)
-
-
-def group_by_pattern(mask: np.ndarray) -> dict[PatternKey, np.ndarray]:
-    """Group row indices by observed-missing pattern."""
-
-    mask_bool = np.asarray(mask, dtype=bool)
-    groups: dict[PatternKey, list[int]] = {}
-    for i, row in enumerate(mask_bool):
-        key = tuple(int(v) for v in row)
-        groups.setdefault(key, []).append(i)
-    return {key: np.asarray(indices, dtype=np.int64) for key, indices in groups.items()}
-
-
-def empirical_likelihood_weights(
-    features: np.ndarray,
-    target_moment: np.ndarray,
-    *,
-    max_iter: int = 100,
-    tol: float = 1e-9,
-    ridge: float = 1e-8,
-    min_denom: float = 1e-8,
-) -> np.ndarray:
-    """Estimate EL weights under ``sum_i w_i features_i = target_moment``.
-
-    The empirical likelihood solution has
-    ``w_i = 1 / (n * (1 + lambda^T h_i))`` with
-    ``h_i = features_i - target_moment``. A damped Newton iteration solves for
-    ``lambda``. If the moment constraint is infeasible or numerically unstable,
-    the caller should catch the warning/fallback behavior upstream.
-    """
-
-    g = np.asarray(features, dtype=np.float64)
-    mu = np.asarray(target_moment, dtype=np.float64).reshape(-1)
-    if g.ndim != 2:
-        raise ValueError("features must have shape (n_samples, n_features).")
-    if g.shape[1] != mu.shape[0]:
-        raise ValueError("target_moment length must match features.shape[1].")
-    if not np.isfinite(g).all() or not np.isfinite(mu).all():
-        raise ValueError("features and target_moment must be finite.")
-
-    n, p = g.shape
-    if p == 0:
-        return np.full(n, 1.0 / n, dtype=np.float64)
-
-    h = g - mu[None, :]
-    scale = h.std(axis=0)
-    scale = np.where(scale > 1e-12, scale, 1.0)
-    h = h / scale[None, :]
-
-    if np.linalg.norm(h.mean(axis=0)) < tol:
-        return np.full(n, 1.0 / n, dtype=np.float64)
-
-    lam = np.zeros(p, dtype=np.float64)
-    last_score_norm = np.inf
-    converged = False
-
-    for _ in range(max_iter):
-        denom = 1.0 + h @ lam
-        if np.any(denom <= min_denom):
-            raise RuntimeError("ELW Newton iterate left the feasible region.")
-
-        score = (h / denom[:, None]).mean(axis=0)
-        score_norm = float(np.linalg.norm(score))
-        if score_norm < tol:
-            converged = True
-            break
-
-        jac = -np.einsum("ni,nj,n->ij", h, h, 1.0 / (denom**2)) / n
-        jac = jac - ridge * np.eye(p)
-        try:
-            step = np.linalg.solve(jac, -score)
-        except np.linalg.LinAlgError as exc:
-            raise RuntimeError("ELW Newton system is singular.") from exc
-
-        accepted = False
-        step_scale = 1.0
-        for _ in range(30):
-            candidate = lam + step_scale * step
-            candidate_denom = 1.0 + h @ candidate
-            if np.any(candidate_denom <= min_denom):
-                step_scale *= 0.5
-                continue
-            candidate_score = (h / candidate_denom[:, None]).mean(axis=0)
-            candidate_norm = float(np.linalg.norm(candidate_score))
-            if candidate_norm < min(last_score_norm, score_norm):
-                lam = candidate
-                last_score_norm = candidate_norm
-                accepted = True
-                break
-            step_scale *= 0.5
-
-        if not accepted:
-            raise RuntimeError("ELW Newton line search failed.")
-
-    if not converged:
-        denom = 1.0 + h @ lam
-        if np.any(denom <= min_denom):
-            raise RuntimeError("ELW did not converge to a feasible solution.")
-        score = (h / denom[:, None]).mean(axis=0)
-        if np.linalg.norm(score) > 1e-5:
-            raise RuntimeError("ELW did not converge sufficiently.")
-
-    denom = 1.0 + h @ lam
-    weights = 1.0 / (n * denom)
-    if np.any(weights <= 0) or not np.isfinite(weights).all():
-        raise RuntimeError("ELW produced invalid weights.")
-
-    weights = weights / weights.sum()
-    return weights.astype(np.float64)
-
-
-def estimate_patternwise_elw_weights(
-    x: np.ndarray,
-    mask: np.ndarray,
-    *,
-    balance_features: np.ndarray | BalanceFn | None = None,
-    target_moments: TargetMoments | None = None,
-    pattern_weight: Literal["frequency", "uniform_patterns"] | Mapping[PatternKey, float] = "frequency",
-    max_iter: int = 100,
-    tol: float = 1e-9,
-    fallback_to_uniform: bool = True,
-) -> PatternWeightResult:
-    """Estimate pattern-wise ELW sample weights.
-
-    Parameters
-    ----------
-    x, mask:
-        Data and observed-entry mask.
-    balance_features:
-        Either an ``(n, p)`` array of fully observed balancing features or a
-        callable returning ``(G_m, mu_m)`` for each pattern. If omitted, within
-        pattern weights are uniform and the method reduces to ordinary CFMI.
-    target_moments:
-        Target moment vector. If ``balance_features`` is an array and
-        ``target_moments`` is omitted, the global mean of ``balance_features``
-        is used. A dict keyed by pattern tuples can provide pattern-specific
-        targets.
-    pattern_weight:
-        ``rho_m``. Use empirical frequencies, uniform pattern weights, or a
-        user-provided dict.
-    """
-
-    x_np = np.asarray(x, dtype=np.float64)
-    mask_np = np.asarray(mask, dtype=bool)
-    if x_np.ndim != 2 or mask_np.shape != x_np.shape:
-        raise ValueError("x and mask must both have shape (n_samples, n_features).")
-
-    n = x_np.shape[0]
-    groups = group_by_pattern(mask_np)
-    sample_weights = np.zeros(n, dtype=np.float64)
-    within: dict[PatternKey, np.ndarray] = {}
-    rho_by_pattern: dict[PatternKey, float] = {}
-
-    balance_array: np.ndarray | None
-    if balance_features is None or callable(balance_features):
-        balance_array = None
-    else:
-        balance_array = np.asarray(balance_features, dtype=np.float64)
-        if balance_array.ndim != 2 or balance_array.shape[0] != n:
-            raise ValueError("balance_features must have shape (n_samples, p).")
-
-    if balance_array is not None and target_moments is None:
-        default_target = np.nanmean(balance_array, axis=0)
-    else:
-        default_target = None
-
-    raw_rhos: dict[PatternKey, float] = {}
-    for key, indices in groups.items():
-        if pattern_weight == "frequency":
-            rho = len(indices) / n
-        elif pattern_weight == "uniform_patterns":
-            rho = 1.0 / len(groups)
-        elif isinstance(pattern_weight, Mapping):
-            rho = float(pattern_weight[key])
-        else:
-            raise ValueError(f"Unknown pattern_weight: {pattern_weight}")
-        raw_rhos[key] = rho
-
-    rho_sum = sum(raw_rhos.values())
-    if rho_sum <= 0:
-        raise ValueError("Pattern weights must have positive sum.")
-    raw_rhos = {key: value / rho_sum for key, value in raw_rhos.items()}
-
-    for key, indices in groups.items():
-        n_m = len(indices)
-        omega = np.full(n_m, 1.0 / n_m, dtype=np.float64)
-
-        if balance_features is not None:
-            try:
-                if callable(balance_features):
-                    g_m, mu_m = balance_features(x_np, mask_np, indices, key)
-                    g_m = np.asarray(g_m, dtype=np.float64)
-                    mu_m = np.asarray(mu_m, dtype=np.float64)
-                else:
-                    g_m = balance_array[indices]
-                    if isinstance(target_moments, Mapping):
-                        mu_m = np.asarray(target_moments[key], dtype=np.float64)
-                    elif target_moments is not None:
-                        mu_m = np.asarray(target_moments, dtype=np.float64)
-                    else:
-                        mu_m = np.asarray(default_target, dtype=np.float64)
-
-                if g_m.shape[0] <= g_m.shape[1]:
-                    raise RuntimeError(
-                        "Too few rows for stable ELW calibration in this pattern."
-                    )
-                omega = empirical_likelihood_weights(
-                    g_m,
-                    mu_m,
-                    max_iter=max_iter,
-                    tol=tol,
-                )
-            except Exception as exc:
-                if not fallback_to_uniform:
-                    raise
-                warnings.warn(
-                    f"Using uniform weights for pattern {key}; ELW failed: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-
-        rho = raw_rhos[key]
-        sample_weights[indices] = rho * omega
-        within[key] = omega
-        rho_by_pattern[key] = rho
-
-    sample_weights = sample_weights / sample_weights.sum()
-    return PatternWeightResult(
-        sample_weights=sample_weights.astype(np.float64),
-        within_pattern_weights=within,
-        pattern_weights=rho_by_pattern,
-        pattern_indices=groups,
-    )
 
 
 def _prepare_incomplete_array(
@@ -483,7 +224,7 @@ class PatternWiseELWCFMI:
 
         self.mean_: np.ndarray | None = None
         self.std_: np.ndarray | None = None
-        self.weight_result_: PatternWeightResult | None = None
+        self.elw_result_: PatternWiseELWResult | None = None
         self.history_: list[dict[str, float]] = []
 
     def fit(
@@ -492,13 +233,24 @@ class PatternWiseELWCFMI:
         mask: np.ndarray | None = None,
         *,
         sample_weights: Sequence[float] | None = None,
-        balance_features: np.ndarray | BalanceFn | None = None,
-        target_moments: TargetMoments | None = None,
-        pattern_weight: Literal["frequency", "uniform_patterns"] | Mapping[PatternKey, float] = "frequency",
+        propensity_by_pattern: Mapping[Pattern, np.ndarray] | None = None,
+        estimate_propensity: bool = False,
+        propensity_kwargs: Mapping[str, object] | None = None,
+        rho_by_pattern: Mapping[Pattern, float] | None = None,
+        elw_clip: tuple[float, float] | None = (1e-6, 1.0 - 1e-6),
+        elw_tol: float = 1e-12,
+        elw_max_iter: int = 200,
         verbose: bool = True,
         log_interval: int = 100,
     ) -> list[dict[str, float]]:
-        """Fit the shared CFMI velocity field."""
+        """Fit the shared CFMI velocity field.
+
+        ELW weights are delegated to ``pattern_wise_elw.py``. Pass externally
+        estimated ``propensity_by_pattern`` to use ``pattern_wise_elw_weights``
+        directly, or set ``estimate_propensity=True`` to use its baseline
+        ``estimate_propensity_by_pattern`` helper. If neither is supplied,
+        uniform sample weights are used.
+        """
 
         x_train, mask_np, mean, std, _ = _prepare_incomplete_array(
             x,
@@ -513,23 +265,39 @@ class PatternWiseELWCFMI:
         self.mean_ = mean
         self.std_ = std
 
-        if sample_weights is None:
-            self.weight_result_ = estimate_patternwise_elw_weights(
-                np.asarray(x, dtype=np.float64),
-                mask_np,
-                balance_features=balance_features,
-                target_moments=target_moments,
-                pattern_weight=pattern_weight,
-            )
-            weights = self.weight_result_.sample_weights
-        else:
+        if sample_weights is not None:
             weights = np.asarray(sample_weights, dtype=np.float64)
             if weights.shape[0] != x_train.shape[0]:
                 raise ValueError("sample_weights length must match x.shape[0].")
             if np.any(weights < 0) or not np.isfinite(weights).all():
                 raise ValueError("sample_weights must be finite and non-negative.")
             weights = weights / weights.sum()
-            self.weight_result_ = None
+            self.elw_result_ = None
+        elif propensity_by_pattern is not None or estimate_propensity:
+            if propensity_by_pattern is not None and estimate_propensity:
+                raise ValueError(
+                    "Pass either propensity_by_pattern or estimate_propensity=True, not both."
+                )
+            if estimate_propensity:
+                kwargs = dict(propensity_kwargs or {})
+                propensity_by_pattern = estimate_propensity_by_pattern(
+                    np.asarray(x, dtype=np.float64),
+                    observed_mask=mask_np,
+                    **kwargs,
+                )
+            self.elw_result_ = pattern_wise_elw_weights(
+                mask_np,
+                propensity_by_pattern,
+                rho_by_pattern=rho_by_pattern,
+                clip=elw_clip,
+                tol=elw_tol,
+                max_iter=elw_max_iter,
+            )
+            weights = np.asarray(self.elw_result_.training_weights, dtype=np.float64)
+            weights = weights / weights.sum()
+        else:
+            weights = np.full(x_train.shape[0], 1.0 / x_train.shape[0], dtype=np.float64)
+            self.elw_result_ = None
 
         trainable = mask_np.sum(axis=1) > 0
         if not np.all(trainable):
@@ -748,13 +516,12 @@ def _demo() -> None:
     mask[:, 4] = rng.random(n) > 0.35
     x_missing = np.where(mask, x_full, np.nan).astype(np.float32)
 
-    # Example balancing features: first two variables, observed for all rows.
-    balance = x_full[:, :2]
     config = CFMIConfig(steps=20, batch_size=64, hidden_dim=64, seed=11)
     model, history = train_pattern_wise_elw_cfmi(
         x_missing,
         config=config,
-        balance_features=balance,
+        estimate_propensity=True,
+        propensity_kwargs={"cross_fit": 3, "random_state": 11},
         verbose=True,
         log_interval=10,
     )
