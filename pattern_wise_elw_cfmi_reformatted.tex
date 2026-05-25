@@ -1,0 +1,359 @@
+\documentclass[12pt,a4paper]{article}
+
+% -------------------- Packages --------------------
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{fancyhdr}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{microtype}
+
+% -------------------- Fonts --------------------
+\setmainfont{NotoSerif-Regular.ttf}[
+  Path=/usr/share/fonts/truetype/noto/,
+  BoldFont=NotoSerif-Bold.ttf,
+  ItalicFont=NotoSerif-Italic.ttf,
+  BoldItalicFont=NotoSerif-BoldItalic.ttf
+]
+\setsansfont{NotoSans-Regular.ttf}[
+  Path=/usr/share/fonts/truetype/noto/,
+  BoldFont=NotoSans-Bold.ttf,
+  ItalicFont=NotoSans-Italic.ttf,
+  BoldItalicFont=NotoSans-BoldItalic.ttf
+]
+\setmonofont{NotoSansMono-Regular.ttf}[
+  Path=/usr/share/fonts/truetype/noto/,
+  BoldFont=NotoSansMono-Bold.ttf
+]
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans Mono CJK SC}
+
+% -------------------- Page style --------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\small Pattern-wise ELW-CFMI 方法说明与伪代码}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+\setlength{\headheight}{15pt}
+
+% -------------------- Formatting --------------------
+\linespread{1.28}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlist[itemize]{leftmargin=2.2em,itemsep=0.25em,topsep=0.25em}
+\setlist[enumerate]{leftmargin=2.2em,itemsep=0.25em,topsep=0.25em}
+\allowdisplaybreaks
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=black,
+    citecolor=black
+}
+
+% -------------------- Algorithm settings --------------------
+\SetKwInput{KwInput}{输入}
+\SetKwInput{KwOutput}{输出}
+\SetKw{KwRet}{返回}
+\SetKwFor{For}{for}{do}{end for}
+\SetKwFor{ForEach}{for each}{do}{end for}
+\SetKwIF{If}{ElseIf}{Else}{if}{then}{else if}{else}{end if}
+\SetAlgoNlRelativeSize{-1}
+\SetAlCapFnt{\small}
+\SetAlCapNameFnt{\small\bfseries}
+\DontPrintSemicolon
+
+% -------------------- Custom commands --------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\Mcal}{\mathcal{M}}
+\newcommand{\Ical}{\mathcal{I}}
+\newcommand{\Lcal}{\mathcal{L}}
+\newcommand{\what}{\widehat}
+\newcommand{\wt}{\widetilde}
+\DeclareMathOperator{\Unif}{Unif}
+
+\begin{document}
+
+\begin{center}
+    {\Large\bfseries Pattern-wise ELW-CFMI：}\par\vspace{0.35em}
+    {\Large 基于观测模式经验似然加权的条件流匹配插补方法}\par\vspace{1.2em}
+    {\normalsize 方法说明与算法伪代码}\par
+\end{center}
+
+\vspace{1.2em}
+
+\section{方法动机}
+
+CFMI 的基本思想是用一个共享的条件连续正规化流（conditional continuous normalizing flow, conditional CNF）学习任意缺失模式下的条件分布
+\begin{equation}
+    p_{\theta}(x_m\mid x_o),
+\end{equation}
+其中 $x_o$ 表示观测变量，$x_m$ 表示缺失变量。训练时，由于真实缺失值不可见，CFMI 在每个样本已经观测到的变量内部随机切分出 conditioning variables 与 target variables，然后用 conditional flow matching 训练条件速度场。
+
+在非 MCAR 情形下，不同观测模式 $M=m$ 下的样本往往不是完整总体的随机样本。若直接在这些有偏观测样本上训练 CFMI，模型学习到的条件关系可能更接近
+\begin{equation}
+    p(x_t\mid x_c,M=m),
+\end{equation}
+而不是总体意义下的目标条件分布
+\begin{equation}
+    p(x_t\mid x_c).
+\end{equation}
+因此，可以先按观测模式分层，在每个观测模式内估计样本级经验似然加权（empirical likelihood weighting, ELW）权重，再将该权重加入 CFMI 的 flow matching 损失中。该方法可概括为
+\begin{equation}
+    \boxed{\text{pattern-wise estimation, sample-wise weighting}.}
+\end{equation}
+也就是说，观测模式 $m$ 用于划分子样本和估计权重；真正进入神经网络训练目标的是每个样本自身的权重 $\what{\omega}^{(m)}_i$。
+
+\section{符号定义}
+
+设完整数据为
+\begin{equation}
+    X=(X_1,\ldots,X_D)\in\R^D,
+\end{equation}
+观测模式为
+\begin{equation}
+    M\in\{0,1\}^D,
+\end{equation}
+其中 $M_j=1$ 表示变量 $X_j$ 被观测，$M_j=0$ 表示变量 $X_j$ 缺失。第 $i$ 个不完整样本记为
+\begin{equation}
+    (x_{i,o},m_i),\qquad i=1,\ldots,n.
+\end{equation}
+
+给定观测模式 $m$，定义该模式下的样本集合为
+\begin{equation}
+    \Ical_m=\{i:m_i=m\},\qquad n_m=|\Ical_m|,
+\end{equation}
+并定义所有出现过的观测模式集合为
+\begin{equation}
+    \Mcal=\{m:n_m>0\}.
+\end{equation}
+
+对样本 $i$，CFMI 训练时从其观测维度中随机切分出两部分 mask：
+\begin{equation}
+    s_{i,c}\in\{0,1\}^D,\qquad s_{i,t}\in\{0,1\}^D,
+\end{equation}
+其中 $s_{i,c}$ 表示 conditioning mask，$s_{i,t}$ 表示 target mask，并满足
+\begin{equation}
+    s_{i,c}\odot s_{i,t}=0,
+    \qquad
+    s_{i,c}+s_{i,t}\leq m_i.
+\end{equation}
+也就是说，训练阶段只能从已经观测到的变量中选择 condition 和 target，真实缺失维度不能被选入训练监督。
+
+\section{Pattern-wise ELW 样本权重}
+
+对每个观测模式 $m\in\Mcal$，在子样本 $\Ical_m$ 内估计一组样本级 ELW 权重
+\begin{equation}
+    \what{\omega}^{(m)}_i,
+    \qquad i\in\Ical_m,
+\end{equation}
+并要求
+\begin{equation}
+    \what{\omega}^{(m)}_i\geq 0,
+    \qquad
+    \sum_{i\in\Ical_m}\what{\omega}^{(m)}_i=1.
+\end{equation}
+这些权重的作用是将模式 $m$ 下的有偏经验分布校正为更接近目标总体分布。一般可以通过如下经验似然约束形式理解：
+\begin{align}
+    \max_{\{\omega^{(m)}_i\}_{i\in\Ical_m}}\quad
+    &\sum_{i\in\Ical_m}\log \omega^{(m)}_i,\\
+    \text{s.t.}\quad
+    &\sum_{i\in\Ical_m}\omega^{(m)}_i=1,
+    \qquad \omega^{(m)}_i\geq 0,\\
+    &\sum_{i\in\Ical_m}\omega^{(m)}_i g_m(x_{i,o})=\what{\mu}_m.
+\end{align}
+其中 $g_m(\cdot)$ 是选定的平衡函数或估计方程，$\what{\mu}_m$ 是目标矩或由外部信息、全样本可观测信息得到的校准量。实际论文中可以根据 ELW 的具体形式设定 $g_m$ 与 $\what{\mu}_m$，例如使用 propensity score、协变量矩条件，或与观测模式相关的平衡约束。
+
+模式层面还可以引入权重 $\rho_m$。若不希望改变不同观测模式在训练目标中的总体占比，可以取经验频率
+\begin{equation}
+    \rho_m=\frac{n_m}{n}.
+\end{equation}
+
+\section{ELW-CFMI 的加权训练目标}
+
+对第 $i$ 个样本，在一次随机切分 $(s_{i,c},s_{i,t})$ 下，令
+\begin{equation}
+    x_{i,c}=x_i[s_{i,c}],
+    \qquad
+    x_{i,t}=x_i[s_{i,t}].
+\end{equation}
+从标准正态分布采样
+\begin{equation}
+    z_{i,t}\sim \N(0,I_{\|s_{i,t}\|_0}),
+\end{equation}
+并取线性 flow matching 路径
+\begin{equation}
+    x^{\tau}_{i,t}=\tau x_{i,t}+(1-\tau)z_{i,t},
+    \qquad
+    \tau\sim\Unif(0,1).
+\end{equation}
+由于本版本暂不引入 Impute-MACFM 的非线性 schedule，目标速度场为
+\begin{equation}
+    u_i=x_{i,t}-z_{i,t}.
+\end{equation}
+
+设 $\wt{x}^{\tau}_{i,t}$ 与 $\wt{x}_{i,c}$ 分别表示补零到 $D$ 维后的 target path state 与 condition vector。CFMI 的单样本条件流匹配损失为
+\begin{equation}
+    \ell_i(\theta)
+    =
+    \E_{s_{i,c},s_{i,t},\tau,z}
+    \left[
+    \frac{1}{\|s_{i,t}\|_0}
+    \left\|
+    v_{\theta}(\wt{x}^{\tau}_{i,t};\wt{x}_{i,c},s_{i,c},\tau)[s_{i,t}]-u_i
+    \right\|_2^2
+    \right].
+\end{equation}
+
+加入样本级 ELW 权重后，总训练目标为
+\begin{equation}
+    \Lcal_{\mathrm{PW\text{-}ELW\text{-}CFMI}}(\theta)
+    =
+    \sum_{m\in\Mcal}\rho_m
+    \sum_{i\in\Ical_m}
+    \what{\omega}^{(m)}_i\ell_i(\theta).
+\end{equation}
+如果取
+\begin{equation}
+    \rho_m=\frac{n_m}{n},
+    \qquad
+    \what{\omega}^{(m)}_i=\frac{1}{n_m},
+\end{equation}
+则有
+\begin{equation}
+    \Lcal_{\mathrm{PW\text{-}ELW\text{-}CFMI}}(\theta)
+    =
+    \frac{1}{n}\sum_{i=1}^{n}\ell_i(\theta),
+\end{equation}
+即退化为原始未加权 CFMI 训练目标。
+
+\section{插补阶段}
+
+训练完成后，对一个待插补样本 $(x_o,m)$，直接将观测变量作为 condition，将缺失变量作为 target：
+\begin{equation}
+    s_c=m,
+    \qquad
+    s_t=1-m.
+\end{equation}
+初始化
+\begin{equation}
+    x_m^{(0)}\sim\N(0,I_{\|1-m\|_0}).
+\end{equation}
+然后用训练好的速度场求解 ODE：
+\begin{equation}
+    \frac{d x_m^{\tau}}{d\tau}
+    =
+    v_{\theta}(\wt{x}^{\tau}_m;\wt{x}_o,m,\tau)[1-m],
+    \qquad \tau\in[0,1].
+\end{equation}
+使用 Euler 离散化时，令 $\Delta=1/K$，有
+\begin{equation}
+    x_m^{(k+1)}
+    =
+    x_m^{(k)}
+    +
+    \Delta\,
+    v_{\theta}(\wt{x}^{(k)}_m;\wt{x}_o,m,k/K)[1-m],
+    \qquad k=0,\ldots,K-1.
+\end{equation}
+最终得到
+\begin{equation}
+    \what{x}_m=x_m^{(K)}.
+\end{equation}
+如果需要多重插补，重复采样不同的初始噪声 $x_m^{(0)}$ 即可得到多组插补值。
+
+\section{算法伪代码}
+
+\begin{algorithm}[H]
+\caption{Pattern-wise ELW-CFMI Training}
+\KwInput{不完整训练数据 $\{(x_{i,o},m_i)\}_{i=1}^{n}$；切分策略 $q(s_c,s_t\mid m)$；模式权重 $\rho_m$；训练步数 $T$；批量大小 $B$。}
+\KwOutput{训练后的条件速度场 $v_{\theta}$。}
+
+按观测模式分组：$\Ical_m=\{i:m_i=m\}$，$m\in\Mcal$。\;
+\ForEach{$m\in\Mcal$}{
+    在子样本 $\Ical_m$ 内估计样本级 ELW 权重
+    $\{\what{\omega}^{(m)}_i:i\in\Ical_m\}$，使
+    $\sum_{i\in\Ical_m}\what{\omega}^{(m)}_i=1$。\;
+}
+初始化神经网络参数 $\theta$。\;
+\For{$r=1,\ldots,T$}{
+    抽取 mini-batch $\mathcal{B}$。\;
+    \ForEach{$i\in\mathcal{B}$}{
+        根据 $q(s_c,s_t\mid m_i)$ 在观测变量内部随机切分，得到 $s_{i,c}$ 与 $s_{i,t}$，满足
+        $s_{i,c}\odot s_{i,t}=0$ 且 $s_{i,c}+s_{i,t}\le m_i$。\;
+        构造 $x_{i,c}=x_i[s_{i,c}]$，$x_{i,t}=x_i[s_{i,t}]$。\;
+        采样 $\tau_i\sim\Unif(0,1)$，$z_{i,t}\sim\N(0,I)$。\;
+        构造线性路径与目标速度：
+        $x_{i,t}^{\tau_i}=\tau_i x_{i,t}+(1-\tau_i)z_{i,t}$，
+        $u_i=x_{i,t}-z_{i,t}$。\;
+        计算单样本 flow matching loss
+        \[
+            \ell_i(\theta)
+            =
+            \frac{1}{\|s_{i,t}\|_0}
+            \left\|
+            v_{\theta}(\wt{x}^{\tau_i}_{i,t};\wt{x}_{i,c},s_{i,c},\tau_i)[s_{i,t}]-u_i
+            \right\|_2^2 .
+        \]
+        取样本训练权重 $a_i=\rho_{m_i}\what{\omega}^{(m_i)}_i$。\;
+    }
+    形成 mini-batch 加权损失
+    \[
+        \widehat{\Lcal}_{\mathcal{B}}(\theta)
+        =
+        \sum_{i\in\mathcal{B}}a_i\ell_i(\theta).
+    \]
+    对 $\theta$ 做一次梯度更新。\;
+}
+\KwRet{$v_{\theta}$。}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Pattern-wise ELW-CFMI Imputation}
+\KwInput{待插补样本 $(x_o,m)$；训练后的速度场 $v_{\theta}$；ODE 步数 $K$；插补次数 $L$。}
+\KwOutput{$L$ 组插补结果 $\{\what{x}^{(\ell)}_m\}_{\ell=1}^{L}$。}
+
+设置推断阶段的 condition 与 target mask：$s_c=m$，$s_t=1-m$。\;
+\For{$\ell=1,\ldots,L$}{
+    初始化缺失部分：$x^{(0,\ell)}_m\sim\N(0,I_{\|1-m\|_0})$。\;
+    令 $\Delta=1/K$。\;
+    \For{$k=0,\ldots,K-1$}{
+        \[
+        x_m^{(k+1,\ell)}
+        =
+        x_m^{(k,\ell)}
+        +
+        \Delta\,
+        v_{\theta}(\wt{x}^{(k,\ell)}_m;\wt{x}_o,m,k/K)[1-m].
+        \]
+    }
+    输出第 $\ell$ 组插补：$\what{x}^{(\ell)}_m=x_m^{(K,\ell)}$。\;
+}
+\KwRet{$\{\what{x}^{(\ell)}_m\}_{\ell=1}^{L}$。}
+\end{algorithm}
+
+\section{方法特点}
+
+\begin{itemize}
+    \item \textbf{样本级加权。} ELW 权重最终对应到每个样本，而不是每个观测模式一个常数权重。
+    \item \textbf{模式内估计。} 按 $M=m$ 分组估计 $\what{\omega}^{(m)}_i$，可以针对不同观测模式的选择偏差进行校正。
+    \item \textbf{共享 CFMI 模型。} 不为每个模式单独训练生成模型，而是训练一个共享条件速度场 $v_{\theta}$，保留 CFMI 对多种缺失模式的可扩展性。
+    \item \textbf{基础版本便于理论分析。} 本版本不使用非线性 schedule、不使用 $s'(t)(X-\varepsilon)$ 的 schedule-consistent velocity，也不引入 projection 约束；因此它是最基础、最便于理论分析的 Pattern-wise ELW-CFMI 版本。
+\end{itemize}
+
+\section{可作为论文中的表述}
+
+可将该方法概括为：在 MAR 与 positivity 条件下，不同观测模式对应的观测样本可能存在模式选择偏差。为缓解该问题，本文提出 Pattern-wise ELW-CFMI 方法：先按观测模式对样本进行分层，在每个观测模式内通过经验似然思想估计样本级权重，再将该权重嵌入 conditional flow matching 的训练目标中，从而使共享条件生成模型在训练时更接近目标总体下的条件分布。该方法在结构上保留 CFMI 的共享条件建模优势，同时通过 ELW 权重引入对观测模式偏倚的稳定校正。
+
+\end{document}
